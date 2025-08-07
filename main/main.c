@@ -224,11 +224,14 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     size_t remaining = req->content_len;
     char buf[CONFIG_UPLOAD_BUF_SIZE];
 
-    while (remaining > 0) {
+    bool error = false;
+    while (remaining > 0 && !error) {
         int to_read = remaining < sizeof(buf) ? remaining : sizeof(buf);
         int r = httpd_req_recv(req, buf, to_read);
-        if (r <= 0)
-            goto fail;
+        if (r <= 0) {
+            error = true;
+            break;
+        }
         remaining -= r;
         int offset = 0;
         if (!header_done) {
@@ -241,14 +244,18 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
                 continue;
             header_done = true;
             char *filename_pos = strstr(header, "filename=");
-            if (!filename_pos)
-                goto fail;
+            if (!filename_pos) {
+                error = true;
+                break;
+            }
             filename_pos += 9;
             if (*filename_pos == '"')
                 filename_pos++;
             char *filename_end = strchr(filename_pos, '"');
-            if (!filename_end)
-                goto fail;
+            if (!filename_end) {
+                error = true;
+                break;
+            }
             size_t fname_len = filename_end - filename_pos;
             if (fname_len >= sizeof(filename))
                 fname_len = sizeof(filename) - 1;
@@ -257,8 +264,10 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
             char path[128];
             snprintf(path, sizeof(path), "/spiffs/%s", filename);
             f = fopen(path, "w");
-            if (!f)
-                goto fail;
+            if (!f) {
+                error = true;
+                break;
+            }
             offset = (p + 4) - header;
             r -= offset;
         }
@@ -291,12 +300,9 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
 
     if (f)
         fclose(f);
+    if (error)
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Upload failed");
     return httpd_resp_sendstr(req, "File uploaded");
-fail:
-    if (f) {
-        fclose(f);
-    }
-    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Upload failed");
 }
 
 static esp_err_t ota_post_handler(httpd_req_t *req)
@@ -329,8 +335,8 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
         int to_read = remaining < sizeof(buf) ? remaining : sizeof(buf);
         int r = httpd_req_recv(req, buf, to_read);
         if (r <= 0) {
-            err = ESP_FAIL;
-            goto cleanup;
+            esp_ota_abort(update_handle);
+            return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
         }
         remaining -= r;
         int offset = 0;
@@ -374,20 +380,18 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
     }
 
     err = esp_ota_end(update_handle);
-    if (err != ESP_OK)
-        goto cleanup;
+    if (err != ESP_OK) {
+        esp_ota_abort(update_handle);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
+    }
     if (esp_ota_set_boot_partition(update_partition) != ESP_OK) {
-        err = ESP_FAIL;
-        goto cleanup;
+        esp_ota_abort(update_handle);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
     }
     httpd_resp_sendstr(req, "Update successful. Rebooting...");
     vTaskDelay(pdMS_TO_TICKS(1000));
     esp_restart();
     return ESP_OK;
-
-cleanup:
-    esp_ota_abort(update_handle);
-    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
 }
 
 static esp_err_t track_get_handler(httpd_req_t *req)
