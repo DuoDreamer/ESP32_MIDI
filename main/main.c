@@ -16,6 +16,7 @@
 
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "midi_player.h"
 
 static const char *TAG = "ESP32_MIDI";
 
@@ -158,6 +159,43 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, "File uploaded");
 }
 
+static esp_err_t track_get_handler(httpd_req_t *req)
+{
+    char query[128];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK)
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No query");
+    char file[64] = {0};
+    char track_str[8] = {0};
+    if (httpd_query_key_value(query, "file", file, sizeof(file)) != ESP_OK ||
+        httpd_query_key_value(query, "track", track_str, sizeof(track_str)) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad params");
+    }
+    int track = atoi(track_str);
+    char path[128];
+    snprintf(path, sizeof(path), "/spiffs/%s", file);
+    if (midi_player_load(path, track) != ESP_OK)
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Load failed");
+    return httpd_resp_sendstr(req, "Track loaded");
+}
+
+static esp_err_t play_get_handler(httpd_req_t *req)
+{
+    if (midi_player_play() != ESP_OK)
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Play failed");
+    return httpd_resp_sendstr(req, "Playing");
+}
+
+static esp_err_t pause_get_handler(httpd_req_t *req)
+{
+    midi_player_pause();
+    return httpd_resp_sendstr(req, "Paused");
+}
+
+static esp_err_t stop_get_handler(httpd_req_t *req)
+{
+    midi_player_stop();
+    return httpd_resp_sendstr(req, "Stopped");
+}
 static httpd_handle_t start_https_server(void)
 {
     httpd_ssl_config_t conf = HTTPD_SSL_CONFIG_DEFAULT();
@@ -205,9 +243,33 @@ static httpd_handle_t start_https_server(void)
             .method = HTTP_POST,
             .handler = upload_post_handler,
         };
+          httpd_uri_t track_get = {
+              .uri = "/track",
+              .method = HTTP_GET,
+              .handler = track_get_handler,
+          };
+          httpd_uri_t play_get = {
+              .uri = "/play",
+              .method = HTTP_GET,
+              .handler = play_get_handler,
+          };
+          httpd_uri_t pause_get = {
+              .uri = "/pause",
+              .method = HTTP_GET,
+              .handler = pause_get_handler,
+          };
+          httpd_uri_t stop_get = {
+              .uri = "/stop",
+              .method = HTTP_GET,
+              .handler = stop_get_handler,
+          };
         httpd_register_uri_handler(server, &root);
         httpd_register_uri_handler(server, &config_post);
         httpd_register_uri_handler(server, &upload_post);
+          httpd_register_uri_handler(server, &track_get);
+          httpd_register_uri_handler(server, &play_get);
+          httpd_register_uri_handler(server, &pause_get);
+          httpd_register_uri_handler(server, &stop_get);
         ESP_LOGI(TAG, "HTTPS server started");
     } else {
         ESP_LOGE(TAG, "Failed to start HTTPS server");
@@ -285,6 +347,7 @@ void app_main(void)
     }
 
     init_spiffs();
+    midi_player_init();
 
     char ssid[32] = {0};
     char pass[64] = {0};
