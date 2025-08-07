@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include "sdkconfig.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -31,6 +32,7 @@ static const char *TAG = "ESP32_MIDI";
 #define AUTH_TOKEN "midi123"
 #define UPDATE_URL "https://example.com/firmware.bin"
 #define OTA_CHECK_INTERVAL_MS (60 * 60 * 1000)
+#define CERT_BUF_SIZE 2048
 
 static bool check_token(httpd_req_t *req)
 {
@@ -40,6 +42,17 @@ static bool check_token(httpd_req_t *req)
             return true;
     }
     return false;
+}
+
+static char *memfind(const char *buf, size_t len, const char *pat, size_t pat_len)
+{
+    if (pat_len == 0)
+        return NULL;
+    for (size_t i = 0; i + pat_len <= len; i++) {
+        if (buf[i] == pat[0] && memcmp(buf + i, pat, pat_len) == 0)
+            return (char *)(buf + i);
+    }
+    return NULL;
 }
 
 static esp_err_t midi_post_handler(httpd_req_t *req)
@@ -119,14 +132,20 @@ static void udp_server_task(void *arg)
     vTaskDelete(NULL);
 }
 
+static StackType_t udp_task_stack[4096];
+static StaticTask_t udp_task_tcb;
+
+
 /* Embedded default certificate and key */
 extern const unsigned char certs_server_cert_pem_start[] asm("_binary_certs_server_cert_pem_start");
 extern const unsigned char certs_server_cert_pem_end[] asm("_binary_certs_server_cert_pem_end");
 extern const unsigned char certs_server_key_pem_start[] asm("_binary_certs_server_key_pem_start");
 extern const unsigned char certs_server_key_pem_end[] asm("_binary_certs_server_key_pem_end");
 
-static char *loaded_cert = NULL;
-static char *loaded_key = NULL;
+static char loaded_cert[CERT_BUF_SIZE];
+static char loaded_key[CERT_BUF_SIZE];
+static size_t loaded_cert_len = 0;
+static size_t loaded_key_len = 0;
 
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
@@ -186,80 +205,98 @@ static esp_err_t config_post_handler(httpd_req_t *req)
 static esp_err_t upload_post_handler(httpd_req_t *req)
 {
     char content_type[64];
-    if (httpd_req_get_hdr_value_str(req, "Content-Type", content_type, sizeof(content_type)) != ESP_OK) {
+    if (httpd_req_get_hdr_value_str(req, "Content-Type", content_type, sizeof(content_type)) != ESP_OK)
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Missing Content-Type");
-    }
     char *b_start = strstr(content_type, "boundary=");
-    if (!b_start) {
+    if (!b_start)
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No boundary");
-    }
     char boundary[70];
     snprintf(boundary, sizeof(boundary), "--%s", b_start + 9);
+    size_t b_len = strlen(boundary);
 
-    char *buf = malloc(req->content_len + 1);
-    if (!buf)
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No mem");
+    char header[256];
+    size_t header_len = 0;
+    bool header_done = false;
+    char filename[64] = {0};
+    FILE *f = NULL;
+    char tail[70];
+    size_t tail_len = 0;
+    size_t remaining = req->content_len;
+    char buf[CONFIG_UPLOAD_BUF_SIZE];
 
-    int received = 0;
-    while (received < req->content_len) {
-        int ret = httpd_req_recv(req, buf + received, req->content_len - received);
-        if (ret <= 0) {
-            free(buf);
-            return ESP_FAIL;
+    while (remaining > 0) {
+        int to_read = remaining < sizeof(buf) ? remaining : sizeof(buf);
+        int r = httpd_req_recv(req, buf, to_read);
+        if (r <= 0)
+            goto fail;
+        remaining -= r;
+        int offset = 0;
+        if (!header_done) {
+            int copy = r < (int)sizeof(header) - (int)header_len - 1 ? r : (int)sizeof(header) - (int)header_len - 1;
+            memcpy(header + header_len, buf, copy);
+            header_len += copy;
+            header[header_len] = '\0';
+            char *p = strstr(header, "\r\n\r\n");
+            if (!p)
+                continue;
+            header_done = true;
+            char *filename_pos = strstr(header, "filename=");
+            if (!filename_pos)
+                goto fail;
+            filename_pos += 9;
+            if (*filename_pos == '"')
+                filename_pos++;
+            char *filename_end = strchr(filename_pos, '"');
+            if (!filename_end)
+                goto fail;
+            size_t fname_len = filename_end - filename_pos;
+            if (fname_len >= sizeof(filename))
+                fname_len = sizeof(filename) - 1;
+            strncpy(filename, filename_pos, fname_len);
+            filename[fname_len] = '\0';
+            char path[128];
+            snprintf(path, sizeof(path), "/spiffs/%s", filename);
+            f = fopen(path, "w");
+            if (!f)
+                goto fail;
+            offset = (p + 4) - header;
+            r -= offset;
         }
-        received += ret;
-    }
-    buf[received] = '\0';
 
-    char *filename_pos = strstr(buf, "filename=");
-    if (!filename_pos) {
-        free(buf);
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No filename");
+        char tmp[CONFIG_UPLOAD_BUF_SIZE + 70];
+        memcpy(tmp, tail, tail_len);
+        memcpy(tmp + tail_len, buf + offset, r);
+        size_t tmp_len = tail_len + r;
+        char *bpos = memfind(tmp, tmp_len, boundary, b_len);
+        if (bpos) {
+            size_t data_len = bpos - tmp;
+            if (data_len >= 2)
+                data_len -= 2; /* strip CRLF */
+            if (data_len > 0 && f)
+                fwrite(tmp, 1, data_len, f);
+            break;
+        } else {
+            if (tmp_len > b_len) {
+                size_t write_len = tmp_len - b_len + 1;
+                if (f)
+                    fwrite(tmp, 1, write_len, f);
+                tail_len = b_len - 1;
+                memcpy(tail, tmp + write_len, tail_len);
+            } else {
+                tail_len = tmp_len;
+                memcpy(tail, tmp, tail_len);
+            }
+        }
     }
-    filename_pos += 9; /* skip 'filename=' */
-    if (*filename_pos == '"') filename_pos++;
-    char *filename_end = strstr(filename_pos, "\"");
-    if (!filename_end) {
-        free(buf);
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Bad filename");
-    }
-    char filename[64];
-    size_t fname_len = filename_end - filename_pos;
-    if (fname_len >= sizeof(filename))
-        fname_len = sizeof(filename) - 1;
-    strncpy(filename, filename_pos, fname_len);
-    filename[fname_len] = '\0';
 
-    char *data_start = strstr(filename_end, "\r\n\r\n");
-    if (!data_start) {
-        free(buf);
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Bad format");
-    }
-    data_start += 4;
-    char *data_end = strstr(data_start, boundary);
-    if (!data_end) {
-        free(buf);
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No boundary end");
-    }
-    int data_len = data_end - data_start;
-    if (data_len < 2) {
-        free(buf);
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Empty file");
-    }
-    data_len -= 2; /* strip CRLF before boundary */
-
-    char path[128];
-    snprintf(path, sizeof(path), "/spiffs/%s", filename);
-    FILE *f = fopen(path, "w");
-    if (!f) {
-        free(buf);
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Open file error");
-    }
-    fwrite(data_start, 1, data_len, f);
-    fclose(f);
-    free(buf);
-
+    if (f)
+        fclose(f);
     return httpd_resp_sendstr(req, "File uploaded");
+fail:
+    if (f) {
+        fclose(f);
+    }
+    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Upload failed");
 }
 
 static esp_err_t ota_post_handler(httpd_req_t *req)
@@ -272,59 +309,85 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No boundary");
     char boundary[70];
     snprintf(boundary, sizeof(boundary), "--%s", b_start + 9);
+    size_t b_len = strlen(boundary);
 
-    char *buf = malloc(req->content_len + 1);
-    if (!buf)
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No mem");
-    int received = 0;
-    while (received < req->content_len) {
-        int ret = httpd_req_recv(req, buf + received, req->content_len - received);
-        if (ret <= 0) {
-            free(buf);
-            return ESP_FAIL;
-        }
-        received += ret;
-    }
-    buf[received] = '\0';
-
-    char *data_start = strstr(buf, "\r\n\r\n");
-    if (!data_start) {
-        free(buf);
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Bad format");
-    }
-    data_start += 4;
-    char *data_end = strstr(data_start, boundary);
-    if (!data_end) {
-        free(buf);
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No boundary end");
-    }
-    int data_len = data_end - data_start;
-    if (data_len < 2) {
-        free(buf);
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Empty file");
-    }
-    data_len -= 2; /* strip CRLF */
+    char header[256];
+    size_t header_len = 0;
+    bool header_done = false;
+    char tail[70];
+    size_t tail_len = 0;
+    size_t remaining = req->content_len;
+    char buf[CONFIG_UPLOAD_BUF_SIZE];
 
     const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
     esp_ota_handle_t update_handle = 0;
     esp_err_t err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
-    if (err != ESP_OK) {
-        free(buf);
+    if (err != ESP_OK)
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
+
+    while (remaining > 0) {
+        int to_read = remaining < sizeof(buf) ? remaining : sizeof(buf);
+        int r = httpd_req_recv(req, buf, to_read);
+        if (r <= 0) {
+            err = ESP_FAIL;
+            goto cleanup;
+        }
+        remaining -= r;
+        int offset = 0;
+        if (!header_done) {
+            int copy = r < (int)sizeof(header) - (int)header_len - 1 ? r : (int)sizeof(header) - (int)header_len - 1;
+            memcpy(header + header_len, buf, copy);
+            header_len += copy;
+            header[header_len] = '\0';
+            char *p = strstr(header, "\r\n\r\n");
+            if (!p)
+                continue;
+            header_done = true;
+            offset = (p + 4) - header;
+            r -= offset;
+        }
+
+        char tmp[CONFIG_UPLOAD_BUF_SIZE + 70];
+        memcpy(tmp, tail, tail_len);
+        memcpy(tmp + tail_len, buf + offset, r);
+        size_t tmp_len = tail_len + r;
+        char *bpos = memfind(tmp, tmp_len, boundary, b_len);
+        if (bpos) {
+            size_t data_len = bpos - tmp;
+            if (data_len >= 2)
+                data_len -= 2;
+            if (data_len > 0)
+                esp_ota_write(update_handle, tmp, data_len);
+            break;
+        } else {
+            if (tmp_len > b_len) {
+                size_t write_len = tmp_len - b_len + 1;
+                if (write_len > 0)
+                    esp_ota_write(update_handle, tmp, write_len);
+                tail_len = b_len - 1;
+                memcpy(tail, tmp + write_len, tail_len);
+            } else {
+                tail_len = tmp_len;
+                memcpy(tail, tmp, tail_len);
+            }
+        }
     }
-    err = esp_ota_write(update_handle, data_start, data_len);
-    if (err != ESP_OK || esp_ota_end(update_handle) != ESP_OK) {
-        esp_ota_abort(update_handle);
-        free(buf);
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
+
+    err = esp_ota_end(update_handle);
+    if (err != ESP_OK)
+        goto cleanup;
+    if (esp_ota_set_boot_partition(update_partition) != ESP_OK) {
+        err = ESP_FAIL;
+        goto cleanup;
     }
-    free(buf);
-    if (esp_ota_set_boot_partition(update_partition) != ESP_OK)
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Boot set failed");
     httpd_resp_sendstr(req, "Update successful. Rebooting...");
     vTaskDelay(pdMS_TO_TICKS(1000));
     esp_restart();
     return ESP_OK;
+
+cleanup:
+    esp_ota_abort(update_handle);
+    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
 }
 
 static esp_err_t track_get_handler(httpd_req_t *req)
@@ -418,29 +481,33 @@ static void ota_auto_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(OTA_CHECK_INTERVAL_MS));
     }
 }
+
+static StackType_t ota_task_stack[8192];
+static StaticTask_t ota_task_tcb;
 static httpd_handle_t start_https_server(void)
 {
     httpd_ssl_config_t conf = HTTPD_SSL_CONFIG_DEFAULT();
 
-    struct stat st;
-    if (stat("/spiffs/server_cert.pem", &st) == 0) {
+    struct stat st_cert, st_key;
+    if (stat("/spiffs/server_cert.pem", &st_cert) == 0 &&
+        stat("/spiffs/server_key.pem", &st_key) == 0 &&
+        st_cert.st_size + 1 < CERT_BUF_SIZE && st_key.st_size + 1 < CERT_BUF_SIZE) {
         FILE *f = fopen("/spiffs/server_cert.pem", "r");
-        loaded_cert = malloc(st.st_size + 1);
-        fread(loaded_cert, 1, st.st_size, f);
-        loaded_cert[st.st_size] = '\0';
+        fread(loaded_cert, 1, st_cert.st_size, f);
+        loaded_cert[st_cert.st_size] = '\0';
         fclose(f);
+        loaded_cert_len = st_cert.st_size + 1;
 
-        stat("/spiffs/server_key.pem", &st);
         f = fopen("/spiffs/server_key.pem", "r");
-        loaded_key = malloc(st.st_size + 1);
-        fread(loaded_key, 1, st.st_size, f);
-        loaded_key[st.st_size] = '\0';
+        fread(loaded_key, 1, st_key.st_size, f);
+        loaded_key[st_key.st_size] = '\0';
         fclose(f);
+        loaded_key_len = st_key.st_size + 1;
 
         conf.cacert_pem = (const uint8_t *)loaded_cert;
-        conf.cacert_len = strlen(loaded_cert) + 1;
+        conf.cacert_len = loaded_cert_len;
         conf.prvtkey_pem = (const uint8_t *)loaded_key;
-        conf.prvtkey_len = strlen(loaded_key) + 1;
+        conf.prvtkey_len = loaded_key_len;
     } else {
         conf.cacert_pem = certs_server_cert_pem_start;
         conf.cacert_len = certs_server_cert_pem_end - certs_server_cert_pem_start;
@@ -613,7 +680,7 @@ void app_main(void)
     }
 
     start_https_server();
-    xTaskCreate(udp_server_task, "udp_server", 4096, NULL, 5, NULL);
-    xTaskCreate(ota_auto_task, "ota_auto", 8192, NULL, 5, NULL);
+    xTaskCreateStatic(udp_server_task, "udp_server", 4096, NULL, 5, udp_task_stack, &udp_task_tcb);
+    xTaskCreateStatic(ota_auto_task, "ota_auto", 8192, NULL, 5, ota_task_stack, &ota_task_tcb);
 }
 

@@ -3,6 +3,7 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "sdkconfig.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,7 +24,8 @@ typedef struct {
     size_t count;
 } midi_track_t;
 
-static midi_track_t s_track = {0};
+static midi_event_t s_events[CONFIG_MIDI_MAX_EVENTS];
+static midi_track_t s_track = { .events = s_events, .count = 0 };
 static size_t s_current = 0;
 static bool s_playing = false;
 static esp_timer_handle_t s_timer;
@@ -88,13 +90,12 @@ static esp_err_t parse_midi(const char *path, int track_index, midi_track_t *out
     uint32_t tempo = 500000;
     double us_per_tick = (double)tempo / division;
 
-    midi_event_t *events = NULL;
+    midi_event_t *events = out->events;
     size_t count = 0;
 
     for (int t = 0; t < ntrks; t++) {
         if (fread(chunk_id, 1, 4, f) != 4 || memcmp(chunk_id, "MTrk", 4) != 0) {
             ESP_LOGE(TAG, "Missing track chunk");
-            free(events);
             fclose(f);
             return ESP_FAIL;
         }
@@ -116,7 +117,6 @@ static esp_err_t parse_midi(const char *path, int track_index, midi_track_t *out
             if (status < 0x80) { /* running status */
                 if (!running) {
                     ESP_LOGE(TAG, "Running status without previous status");
-                    free(events);
                     fclose(f);
                     return ESP_FAIL;
                 }
@@ -150,13 +150,11 @@ static esp_err_t parse_midi(const char *path, int track_index, midi_track_t *out
             int needed = ((status & 0xF0) == 0xC0 || (status & 0xF0) == 0xD0) ? 1 : 2;
             uint8_t data[2] = {0};
             fread(data, 1, needed, f);
-            midi_event_t *tmp = realloc(events, (count + 1) * sizeof(midi_event_t));
-            if (!tmp) {
-                free(events);
+            if (count >= CONFIG_MIDI_MAX_EVENTS) {
+                ESP_LOGE(TAG, "Too many events, increase CONFIG_MIDI_MAX_EVENTS");
                 fclose(f);
                 return ESP_ERR_NO_MEM;
             }
-            events = tmp;
             events[count].time_us = time_us;
             events[count].data[0] = status;
             events[count].len = needed + 1;
@@ -169,7 +167,6 @@ static esp_err_t parse_midi(const char *path, int track_index, midi_track_t *out
     }
 
     fclose(f);
-    out->events = events;
     out->count = count;
     ESP_LOGI(TAG, "Parsed %zu events", count);
     return ESP_OK;
@@ -213,11 +210,7 @@ esp_err_t midi_player_init(void)
 
 esp_err_t midi_player_load(const char *path, int track_index)
 {
-    if (s_track.events) {
-        free(s_track.events);
-        s_track.events = NULL;
-        s_track.count = 0;
-    }
+    s_track.count = 0;
     s_current = 0;
     return parse_midi(path, track_index, &s_track);
 }

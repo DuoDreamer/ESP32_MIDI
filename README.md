@@ -14,3 +14,16 @@ This repository contains a minimal ESP-IDF project with a custom partition table
 * Captive-style Wi-Fi configuration portal with SoftAP fallback.
 * HTTPS server using the ESP-IDF `esp_https_server` with a self-signed certificate or user-uploaded certificate/key.
 * Multipart file upload endpoint that stores uploaded files to the SPIFFS partition.
+
+## Low-memory configuration
+
+The project targets ESP32 modules with limited RAM and flash. The following build-time
+options can be tuned via `menuconfig` or `sdkconfig.defaults`:
+
+* `CONFIG_MIDI_MAX_EVENTS` – maximum number of parsed MIDI events held in RAM.
+  Reduce this value for smaller tracks or increase for complex files.
+* `CONFIG_UPLOAD_BUF_SIZE` – chunk size used for file and OTA uploads. Smaller
+  values lower RAM usage at the cost of transfer speed.
+
+Uploaded files are written in chunks to SPIFFS so large transfers do not require
+additional heap. Ensure that uploaded files fit within the 1 MB SPIFFS partition.
