@@ -1,0 +1,13 @@
+menu "ESP32 MIDI Options"
+    config MIDI_MAX_EVENTS
+        int "Maximum number of MIDI events"
+        default 1024
+        help
+            Limit for statically allocated MIDI event buffer.
+
+    config UPLOAD_BUF_SIZE
+        int "Upload buffer size (bytes)"
+        default 4096
+        help
+            Chunk size for file and OTA uploads.
+endmenu
