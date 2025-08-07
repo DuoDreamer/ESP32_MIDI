@@ -253,3 +253,11 @@ esp_err_t midi_player_stop(void)
     s_playing = false;
     return ESP_OK;
 }
+
+esp_err_t midi_player_send(const uint8_t *data, size_t len)
+{
+    if (!data || len == 0)
+        return ESP_ERR_INVALID_ARG;
+    int sent = uart_write_bytes(MIDI_UART_NUM, (const char *)data, len);
+    return (sent == (int)len) ? ESP_OK : ESP_FAIL;
+}

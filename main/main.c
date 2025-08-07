@@ -17,8 +17,102 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "midi_player.h"
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
+#include <stdbool.h>
+#include <ctype.h>
+#include <stdlib.h>
 
 static const char *TAG = "ESP32_MIDI";
+
+#define AUTH_TOKEN "midi123"
+
+static bool check_token(httpd_req_t *req)
+{
+    char token[32];
+    if (httpd_req_get_hdr_value_str(req, "X-Auth-Token", token, sizeof(token)) == ESP_OK) {
+        if (strcmp(token, AUTH_TOKEN) == 0)
+            return true;
+    }
+    return false;
+}
+
+static esp_err_t midi_post_handler(httpd_req_t *req)
+{
+    if (!check_token(req))
+        return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Unauthorized");
+
+    char buf[64];
+    int received = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (received <= 0)
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No data");
+    buf[received] = '\0';
+
+    uint8_t midi[3];
+    size_t midi_len = 0;
+    char *p = buf;
+    while (*p && midi_len < sizeof(midi)) {
+        while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')
+            p++;
+        if (!isxdigit((unsigned char)p[0]) || !isxdigit((unsigned char)p[1]))
+            break;
+        char byte_str[3] = {p[0], p[1], 0};
+        midi[midi_len++] = strtol(byte_str, NULL, 16);
+        p += 2;
+    }
+    if (midi_len == 0)
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad data");
+    midi_player_send(midi, midi_len);
+    return httpd_resp_sendstr(req, "OK");
+}
+
+static esp_err_t ws_handler(httpd_req_t *req)
+{
+    if (req->method == HTTP_GET) {
+        if (!check_token(req))
+            return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "Unauthorized");
+        return ESP_OK;
+    }
+
+    httpd_ws_frame_t ws_pkt;
+    uint8_t buf[32];
+    memset(&ws_pkt, 0, sizeof(ws_pkt));
+    ws_pkt.payload = buf;
+    esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, sizeof(buf));
+    if (ret != ESP_OK)
+        return ret;
+    if (ws_pkt.len > 0)
+        midi_player_send(ws_pkt.payload, ws_pkt.len);
+    return ESP_OK;
+}
+
+static void udp_server_task(void *arg)
+{
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(5005),
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+    };
+    bind(sock, (struct sockaddr *)&addr, sizeof(addr));
+    while (1) {
+        uint8_t rx_buffer[64];
+        struct sockaddr_in source_addr;
+        socklen_t socklen = sizeof(source_addr);
+        int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer), 0,
+                           (struct sockaddr *)&source_addr, &socklen);
+        if (len <= 0)
+            continue;
+        size_t token_len = strlen(AUTH_TOKEN);
+        if (len <= token_len + 1)
+            continue;
+        if (memcmp(rx_buffer, AUTH_TOKEN, token_len) != 0 || rx_buffer[token_len] != ':')
+            continue;
+        midi_player_send(rx_buffer + token_len + 1, len - token_len - 1);
+    }
+    close(sock);
+    vTaskDelete(NULL);
+}
 
 /* Embedded default certificate and key */
 extern const unsigned char certs_server_cert_pem_start[] asm("_binary_certs_server_cert_pem_start");
@@ -263,6 +357,17 @@ static httpd_handle_t start_https_server(void)
               .method = HTTP_GET,
               .handler = stop_get_handler,
           };
+        httpd_uri_t midi_post = {
+            .uri = "/midi",
+            .method = HTTP_POST,
+            .handler = midi_post_handler,
+        };
+        httpd_uri_t ws = {
+            .uri = "/ws",
+            .method = HTTP_GET,
+            .handler = ws_handler,
+            .is_websocket = true,
+        };
         httpd_register_uri_handler(server, &root);
         httpd_register_uri_handler(server, &config_post);
         httpd_register_uri_handler(server, &upload_post);
@@ -270,6 +375,8 @@ static httpd_handle_t start_https_server(void)
           httpd_register_uri_handler(server, &play_get);
           httpd_register_uri_handler(server, &pause_get);
           httpd_register_uri_handler(server, &stop_get);
+        httpd_register_uri_handler(server, &midi_post);
+        httpd_register_uri_handler(server, &ws);
         ESP_LOGI(TAG, "HTTPS server started");
     } else {
         ESP_LOGE(TAG, "Failed to start HTTPS server");
@@ -370,5 +477,6 @@ void app_main(void)
     }
 
     start_https_server();
+    xTaskCreate(udp_server_task, "udp_server", 4096, NULL, 5, NULL);
 }
 
