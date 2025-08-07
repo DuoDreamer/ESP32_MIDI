@@ -12,6 +12,9 @@
 #include "esp_wifi.h"
 
 #include "esp_https_server.h"
+#include "esp_http_client.h"
+#include "esp_ota_ops.h"
+#include "esp_app_format.h"
 #include "esp_spiffs.h"
 
 #include "nvs.h"
@@ -26,6 +29,8 @@
 static const char *TAG = "ESP32_MIDI";
 
 #define AUTH_TOKEN "midi123"
+#define UPDATE_URL "https://example.com/firmware.bin"
+#define OTA_CHECK_INTERVAL_MS (60 * 60 * 1000)
 
 static bool check_token(httpd_req_t *req)
 {
@@ -136,6 +141,10 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "<form method='POST' action='/upload' enctype='multipart/form-data'>"
         "<input type='file' name='file'>"
         "<input type='submit' value='Upload'></form>"
+        "<h2>Firmware Update</h2>"
+        "<form method='POST' action='/ota' enctype='multipart/form-data'>"
+        "<input type='file' name='file'>"
+        "<input type='submit' value='Update Firmware'></form>"
         "</body></html>";
 
     httpd_resp_set_type(req, "text/html");
@@ -253,6 +262,71 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, "File uploaded");
 }
 
+static esp_err_t ota_post_handler(httpd_req_t *req)
+{
+    char content_type[64];
+    if (httpd_req_get_hdr_value_str(req, "Content-Type", content_type, sizeof(content_type)) != ESP_OK)
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Missing Content-Type");
+    char *b_start = strstr(content_type, "boundary=");
+    if (!b_start)
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No boundary");
+    char boundary[70];
+    snprintf(boundary, sizeof(boundary), "--%s", b_start + 9);
+
+    char *buf = malloc(req->content_len + 1);
+    if (!buf)
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No mem");
+    int received = 0;
+    while (received < req->content_len) {
+        int ret = httpd_req_recv(req, buf + received, req->content_len - received);
+        if (ret <= 0) {
+            free(buf);
+            return ESP_FAIL;
+        }
+        received += ret;
+    }
+    buf[received] = '\0';
+
+    char *data_start = strstr(buf, "\r\n\r\n");
+    if (!data_start) {
+        free(buf);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Bad format");
+    }
+    data_start += 4;
+    char *data_end = strstr(data_start, boundary);
+    if (!data_end) {
+        free(buf);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No boundary end");
+    }
+    int data_len = data_end - data_start;
+    if (data_len < 2) {
+        free(buf);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Empty file");
+    }
+    data_len -= 2; /* strip CRLF */
+
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+    esp_ota_handle_t update_handle = 0;
+    esp_err_t err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
+    if (err != ESP_OK) {
+        free(buf);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
+    }
+    err = esp_ota_write(update_handle, data_start, data_len);
+    if (err != ESP_OK || esp_ota_end(update_handle) != ESP_OK) {
+        esp_ota_abort(update_handle);
+        free(buf);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
+    }
+    free(buf);
+    if (esp_ota_set_boot_partition(update_partition) != ESP_OK)
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Boot set failed");
+    httpd_resp_sendstr(req, "Update successful. Rebooting...");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+    return ESP_OK;
+}
+
 static esp_err_t track_get_handler(httpd_req_t *req)
 {
     char query[128];
@@ -289,6 +363,60 @@ static esp_err_t stop_get_handler(httpd_req_t *req)
 {
     midi_player_stop();
     return httpd_resp_sendstr(req, "Stopped");
+}
+
+static void ota_auto_task(void *arg)
+{
+    while (1) {
+        esp_http_client_config_t config = {
+            .url = UPDATE_URL,
+            .cert_pem = (const char *)certs_server_cert_pem_start,
+        };
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        if (client && esp_http_client_open(client, 0) == ESP_OK) {
+            const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+            esp_ota_handle_t update_handle = 0;
+            esp_err_t err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
+            if (err == ESP_OK) {
+                bool header_checked = false;
+                esp_app_desc_t new_app_info;
+                const esp_app_desc_t *running_app_info = esp_app_get_description();
+                char buf[1024];
+                int data_read;
+                while ((data_read = esp_http_client_read(client, buf, sizeof(buf))) > 0) {
+                    if (!header_checked) {
+                        if (data_read > sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + sizeof(esp_app_desc_t)) {
+                            memcpy(&new_app_info, buf + sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t), sizeof(esp_app_desc_t));
+                            if (!memcmp(new_app_info.version, running_app_info->version, sizeof(new_app_info.version))) {
+                                ESP_LOGI(TAG, "Firmware up to date");
+                                esp_ota_abort(update_handle);
+                                break;
+                            }
+                            header_checked = true;
+                        }
+                    }
+                    err = esp_ota_write(update_handle, buf, data_read);
+                    if (err != ESP_OK)
+                        break;
+                }
+                if (header_checked && err == ESP_OK && esp_ota_end(update_handle) == ESP_OK) {
+                    if (esp_ota_set_boot_partition(update_partition) == ESP_OK) {
+                        ESP_LOGI(TAG, "OTA update applied, rebooting");
+                        esp_restart();
+                    }
+                } else {
+                    esp_ota_abort(update_handle);
+                    ESP_LOGE(TAG, "OTA update failed");
+                    esp_ota_mark_app_invalid_rollback_and_reboot();
+                }
+            }
+        }
+        if (client) {
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+        }
+        vTaskDelay(pdMS_TO_TICKS(OTA_CHECK_INTERVAL_MS));
+    }
 }
 static httpd_handle_t start_https_server(void)
 {
@@ -337,6 +465,11 @@ static httpd_handle_t start_https_server(void)
             .method = HTTP_POST,
             .handler = upload_post_handler,
         };
+        httpd_uri_t ota_post = {
+            .uri = "/ota",
+            .method = HTTP_POST,
+            .handler = ota_post_handler,
+        };
           httpd_uri_t track_get = {
               .uri = "/track",
               .method = HTTP_GET,
@@ -371,6 +504,7 @@ static httpd_handle_t start_https_server(void)
         httpd_register_uri_handler(server, &root);
         httpd_register_uri_handler(server, &config_post);
         httpd_register_uri_handler(server, &upload_post);
+        httpd_register_uri_handler(server, &ota_post);
           httpd_register_uri_handler(server, &track_get);
           httpd_register_uri_handler(server, &play_get);
           httpd_register_uri_handler(server, &pause_get);
@@ -447,6 +581,8 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "ESP32 MIDI project initialized");
 
+    esp_ota_mark_app_valid_cancel_rollback();
+
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -478,5 +614,6 @@ void app_main(void)
 
     start_https_server();
     xTaskCreate(udp_server_task, "udp_server", 4096, NULL, 5, NULL);
+    xTaskCreate(ota_auto_task, "ota_auto", 8192, NULL, 5, NULL);
 }
 
