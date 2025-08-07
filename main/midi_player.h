@@ -22,6 +22,9 @@ esp_err_t midi_player_pause(void);
 /* Stop playback and reset to start */
 esp_err_t midi_player_stop(void);
 
+/* Send raw MIDI bytes directly to UART */
+esp_err_t midi_player_send(const uint8_t *data, size_t len);
+
 #ifdef __cplusplus
 }
 #endif
